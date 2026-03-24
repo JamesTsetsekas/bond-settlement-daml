@@ -1,0 +1,211 @@
+-- | Test: Compliance check scenarios.
+-- Covers KYC onboarding lifecycle, trade reporting to DTCC GTR,
+-- and position limit enforcement — all critical to DTCC's regulatory mandate.
+module Test.TestCompliance where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+
+import Compliance
+
+-- | Test KYC onboarding: Pending → Approved → Expired → re-Pending.
+testKycLifecycle : Script ()
+testKycLifecycle = do
+  regulator   <- allocatePartyWithHint "FINRA-Regulator"  (PartyIdHint "FINRA")
+  ccp         <- allocatePartyWithHint "NSCC-KYC"         (PartyIdHint "NSCCKyc")
+  participant <- allocatePartyWithHint "HedgeFund-A"      (PartyIdHint "HFundA")
+
+  let approvedDate = date 2025 Jan 15
+      expiryDate   = date 2026 Jan 15
+
+  -- ── Step 1: Create pending KYC record ───────────────────────────────────
+  kycCid <- submit regulator do
+    createCmd KycRecord with
+      participant  = participant
+      regulator    = regulator
+      ccp          = ccp
+      legalName    = "Hedge Fund Alpha LLC"
+      lei          = "5493001KJTIIGC8Y1R12"
+      kycStatus    = Pending
+      riskTier     = Medium
+      approvedDate = None
+      expiryDate   = None
+      notes        = "Initial onboarding submission"
+
+  debug "✓ KYC record created in Pending state"
+
+  -- ── Step 2: Regulator approves ─────────────────────────────────────────
+  approvedCid <- submit regulator do
+    exerciseCmd kycCid ApproveKyc with
+      approvedOn = approvedDate
+      expiresOn  = expiryDate
+
+  kyc <- queryContractId regulator approvedCid
+  case kyc of
+    None   -> abort "KYC record not found after approval"
+    Some k -> do
+      assertMsg "KYC should be Approved" (k.kycStatus == Approved)
+      assertMsg "Approved date should be set" (k.approvedDate == Some approvedDate)
+
+  debug "✓ KYC approved: HedgeFund-A can now trade"
+
+  -- ── Step 3: Expire the KYC ─────────────────────────────────────────────
+  expiredCid <- submit regulator do
+    exerciseCmd approvedCid ExpireKyc
+
+  expiredKyc <- queryContractId regulator expiredCid
+  case expiredKyc of
+    None   -> abort "Expired KYC record not found"
+    Some k -> assertMsg "KYC should be Expired" (k.kycStatus == Expired)
+
+  debug "✓ KYC expired — participant must re-onboard"
+
+  -- ── Step 4: Negative test — cannot approve an already-expired record ────
+  submitMustFail regulator do
+    exerciseCmd expiredCid ApproveKyc with
+      approvedOn = date 2026 Feb 01
+      expiresOn  = date 2027 Feb 01
+
+  debug "✓ Cannot approve an Expired KYC record (correctly rejected)"
+  debug "✓ TestKycLifecycle PASSED"
+  return ()
+
+
+-- | Test trade reporting: submit, amend, cancel.
+testTradeReporting : Script ()
+testTradeReporting = do
+  reporter        <- allocatePartyWithHint "MorganStanley-Reporter" (PartyIdHint "MS")
+  tradeRepository <- allocatePartyWithHint "DTCC-GTR"               (PartyIdHint "GTR")
+
+  let tradeDate  = date 2025 Mar 10
+      reportDate = date 2025 Mar 10
+
+  -- ── Submit initial trade report ────────────────────────────────────────
+  reportCid <- submit reporter do
+    createCmd TradeReport with
+      reportId        = "GTR-2025-03-10-001"
+      reporter        = reporter
+      tradeRepository = tradeRepository
+      tradeId         = "TRD-MS-20250310-0042"
+      instrument      = "US912828ZQ26"   -- 10Y UST
+      notional        = 10_000_000.0
+      currency        = "USD"
+      tradeDate       = tradeDate
+      reportDate      = reportDate
+      isAmendment     = False
+      isCancel        = False
+
+  debug "✓ Trade report submitted to DTCC GTR"
+
+  -- ── Repository acknowledges ────────────────────────────────────────────
+  ackedCid <- submit tradeRepository do
+    exerciseCmd reportCid AcknowledgeReport
+
+  debug "✓ DTCC GTR acknowledged the trade report"
+
+  -- ── Amend the report (notional correction) ─────────────────────────────
+  amendedCid <- submit reporter do
+    exerciseCmd ackedCid AmendReport with
+      amendedNotional = 12_000_000.0
+      amendDate       = date 2025 Mar 11
+
+  amended <- queryContractId reporter amendedCid
+  case amended of
+    None   -> abort "Amended report not found"
+    Some r -> do
+      assertMsg "Notional should be updated" (r.notional == 12_000_000.0)
+      assertMsg "Amendment flag should be set" (r.isAmendment == True)
+
+  debug "✓ Trade report amended: notional corrected to $12M"
+
+  -- ── Cancel the report ──────────────────────────────────────────────────
+  cancelledCid <- submit reporter do
+    exerciseCmd amendedCid CancelReport with
+      cancelDate = date 2025 Mar 12
+
+  cancelled <- queryContractId reporter cancelledCid
+  case cancelled of
+    None   -> abort "Cancelled report not found"
+    Some r -> assertMsg "Cancel flag should be set" (r.isCancel == True)
+
+  debug "✓ Trade report cancelled"
+  debug "✓ TestTradeReporting PASSED"
+  return ()
+
+
+-- | Test position limits: check, update, breach detection.
+testPositionLimits : Script ()
+testPositionLimits = do
+  regulator   <- allocatePartyWithHint "SEC-Limits"       (PartyIdHint "SECLim")
+  ccp         <- allocatePartyWithHint "NSCC-Limits"      (PartyIdHint "NSCCLim")
+  participant <- allocatePartyWithHint "HedgeFund-Limits" (PartyIdHint "HFLim")
+
+  -- ── Create position limit for US Treasuries ────────────────────────────
+  limitCid <- submit regulator do
+    createCmd PositionLimit with
+      regulator  = regulator
+      ccp        = ccp
+      instrument = "US-TREASURY-10Y"
+      maxLong    = 50_000_000.0
+      maxShort   = 25_000_000.0
+      currency   = "USD"
+
+  debug "✓ Position limits set: Long $50M / Short $25M"
+
+  -- ── Create a position for the participant ─────────────────────────────
+  positionCid <- submit ccp do
+    createCmd Position with
+      participant = participant
+      ccp         = ccp
+      instrument  = "US-TREASURY-10Y"
+      longPos     = 30_000_000.0   -- already long $30M
+      shortPos    = 0.0
+      currency    = "USD"
+
+  debug "✓ Current position: Long $30M"
+
+  -- ── Check a trade that would stay within limits ─────────────────────────
+  withinLimits <- submit ccp do
+    exerciseCmd positionCid CheckPositionLimit with
+      limitCid   = limitCid
+      tradeDelta = 15_000_000.0   -- buying another $15M → projected $45M
+
+  assertMsg "Trade should be within limits ($45M < $50M max)" withinLimits
+  debug "✓ $15M buy — within position limits ($45M projected)"
+
+  -- ── Check a trade that would breach the limit ──────────────────────────
+  wouldBreach <- submit ccp do
+    exerciseCmd positionCid CheckPositionLimit with
+      limitCid   = limitCid
+      tradeDelta = 25_000_000.0   -- buying $25M → projected $55M > $50M
+
+  assertMsg "Trade should breach the position limit" (not wouldBreach)
+  debug "✓ $25M buy correctly flagged as limit breach ($55M > $50M max)"
+
+  -- ── Update position after an approved trade ───────────────────────────
+  updatedCid <- submit ccp do
+    exerciseCmd positionCid UpdatePosition with
+      deltaLong  = 15_000_000.0
+      deltaShort = 0.0
+
+  updated <- queryContractId ccp updatedCid
+  case updated of
+    None   -> abort "Updated position not found"
+    Some p -> assertMsg "Long position should be $45M" (p.longPos == 45_000_000.0)
+
+  debug "✓ Position updated to Long $45M"
+
+  -- ── Regulator updates the limit (emergency tightening) ─────────────────
+  newLimitCid <- submit regulator do
+    exerciseCmd limitCid UpdateLimits with
+      newMaxLong  = 40_000_000.0   -- tighten to $40M
+      newMaxShort = 20_000_000.0
+
+  newLimit <- queryContractId regulator newLimitCid
+  case newLimit of
+    None   -> abort "Updated limit not found"
+    Some l -> assertMsg "New max long should be $40M" (l.maxLong == 40_000_000.0)
+
+  debug "✓ Position limits tightened: Long $40M / Short $20M"
+  debug "✓ TestPositionLimits PASSED"
+  return ()

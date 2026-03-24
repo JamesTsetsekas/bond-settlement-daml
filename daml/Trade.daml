@@ -1,0 +1,105 @@
+-- | Trade matching and lifecycle template.
+-- Models the negotiation and confirmation of a bond trade between
+-- counterparties, prior to submission to the CCP (NSCC) for clearing.
+-- Status lifecycle: Proposed → Accepted → Settled | Rejected
+module Trade where
+
+import DA.Date (Date)
+
+-- | Lifecycle status of a trade.
+data TradeStatus
+  = Proposed
+  | Accepted
+  | Settled
+  | Rejected
+  | Cancelled
+  deriving (Eq, Show)
+
+-- | A bond trade proposal from buyer to seller.
+-- Once both sides confirm, the trade is eligible for CCP clearing.
+template Trade
+  with
+    tradeId        : Text       -- ^ Unique trade identifier
+    buyer          : Party      -- ^ Purchasing counterparty
+    seller         : Party      -- ^ Selling counterparty
+    ccp            : Party      -- ^ Central counterparty (NSCC/DTCC)
+    bondId         : Text       -- ^ ISIN/CUSIP of the bond being traded
+    faceValue      : Decimal    -- ^ Notional face value of the block
+    price          : Decimal    -- ^ Agreed clean price (% of par, e.g. 99.50)
+    settlementDate : Date       -- ^ Target settlement date (T+1 or T+2)
+    currency       : Text       -- ^ Settlement currency
+    status         : TradeStatus
+  where
+    signatory buyer
+    observer  seller, ccp
+
+    ensure faceValue > 0.0
+        && price > 0.0
+
+    -- | Buyer proposes the trade to the seller.
+    -- This transitions from initial creation to a seller-visible proposal.
+    choice ProposeTradeToSeller : ContractId Trade
+      controller buyer
+      do
+        assertMsg "Trade must be in initial state to propose"
+                  (status == Proposed)
+        create this with status = Proposed
+
+    -- | Seller accepts the trade terms. CCP is now a signatory for clearing.
+    choice AcceptTrade : ContractId Trade
+      controller seller
+      do
+        assertMsg "Trade must be Proposed to accept" (status == Proposed)
+        create this with status = Accepted
+
+    -- | Seller rejects the trade (price, terms, or KYC failure).
+    choice RejectTrade : ContractId Trade
+      with
+        reason : Text
+      controller seller
+      do
+        assertMsg "Trade must be Proposed to reject" (status == Proposed)
+        create this with status = Rejected
+
+    -- | CCP marks trade as settled after DVP completion.
+    -- Called by the Settlement contract upon successful execution.
+    choice MarkSettled : ContractId Trade
+      controller ccp
+      do
+        assertMsg "Trade must be Accepted before settlement" (status == Accepted)
+        create this with status = Settled
+
+    -- | Either party can cancel before acceptance (e.g. error correction).
+    choice CancelTrade : ContractId Trade
+      with
+        requestor : Party
+        reason    : Text
+      controller buyer
+      do
+        assertMsg "Cannot cancel a settled or rejected trade"
+                  (status == Proposed || status == Accepted)
+        create this with status = Cancelled
+
+
+-- | CCP novation record: created when the CCP interposes itself between
+-- buyer and seller after trade acceptance. Each leg is a separate
+-- bilateral contract with the CCP.
+template CCPNovation
+  with
+    novationId  : Text
+    tradeId     : Text
+    ccp         : Party
+    counterparty: Party
+    role        : Text    -- ^ "BUY" or "SELL"
+    bondId      : Text
+    faceValue   : Decimal
+    price       : Decimal
+    currency    : Text
+  where
+    signatory ccp, counterparty
+
+    ensure faceValue > 0.0 && price > 0.0
+
+    choice AcknowledgeNovation : ()
+      controller counterparty
+      do return ()

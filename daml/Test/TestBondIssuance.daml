@@ -1,0 +1,87 @@
+-- | Test: Full bond issuance lifecycle.
+-- Demonstrates: BondIssuanceProposal → depository acceptance →
+-- active Bond → Transfer → Redeem.
+module Test.TestBondIssuance where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+
+import Bond
+
+testBondIssuanceFull : Script ()
+testBondIssuanceFull = do
+  -- ── Allocate parties ────────────────────────────────────────────────────
+  issuer     <- allocatePartyWithHint "GoldmanSachs-Issuer" (PartyIdHint "GoldmanSachs")
+  buyer      <- allocatePartyWithHint "BlackRock-Buyer"     (PartyIdHint "BlackRock")
+  buyer2     <- allocatePartyWithHint "Vanguard-Buyer2"     (PartyIdHint "Vanguard")
+  dtc        <- allocatePartyWithHint "DTC-Depository"      (PartyIdHint "DTC")
+  sec        <- allocatePartyWithHint "SEC-Regulator"       (PartyIdHint "SEC")
+
+  -- ── Step 1: Issuer proposes a bond issuance to DTC ─────────────────────
+  let maturity = date 2030 Dec 31
+  proposalCid <- submit issuer do
+    createCmd BondIssuanceProposal with
+      issuer        = issuer
+      depository    = dtc
+      regulator     = sec
+      bondId        = "US38141G1040"   -- fictional CUSIP
+      faceValue     = 1_000_000.0      -- $1,000,000 face value
+      couponRate    = 0.045            -- 4.5% coupon
+      maturityDate  = maturity
+      currency      = "USD"
+      initialHolder = buyer
+
+  -- ── Step 2: DTC accepts the issuance — bond becomes active ─────────────
+  bondCid <- submit dtc do
+    exerciseCmd proposalCid AcceptIssuance
+
+  -- ── Verify bond was created with correct state ─────────────────────────
+  bond <- queryContractId dtc bondCid
+  case bond of
+    None   -> abort "Bond contract not found after issuance!"
+    Some b -> do
+      assertMsg "Issuer should be Goldman Sachs" (b.issuer == issuer)
+      assertMsg "Initial holder should be BlackRock" (b.holder == buyer)
+      assertMsg "Bond should be Active" (b.status == Active)
+      assertMsg "Coupon rate should be 4.5%" (b.couponRate == 0.045)
+
+  debug "✓ Bond issued successfully: US38141G1040, $1M face value, 4.5% coupon"
+
+  -- ── Step 3: Transfer bond from BlackRock to Vanguard ───────────────────
+  newBondCid <- submit buyer do
+    exerciseCmd bondCid Transfer with newHolder = buyer2
+
+  -- Depository must co-sign — in practice this is done via DTC's SDFS
+  -- (here we model it as a two-step: holder proposes, depository executes)
+  transferredBond <- queryContractId dtc newBondCid
+  case transferredBond of
+    None   -> abort "Bond not found after transfer"
+    Some b -> assertMsg "New holder should be Vanguard" (b.holder == buyer2)
+
+  debug "✓ Bond transferred: BlackRock → Vanguard"
+
+  -- ── Step 4: Issuer redeems the bond (at maturity) ──────────────────────
+  submit issuer do
+    exerciseCmd newBondCid Redeem
+
+  debug "✓ Bond redeemed at maturity"
+
+  -- ── Step 5: Negative test — confirm rejected issuance archives cleanly ──
+  badProposalCid <- submit issuer do
+    createCmd BondIssuanceProposal with
+      issuer        = issuer
+      depository    = dtc
+      regulator     = sec
+      bondId        = "INVALID001"
+      faceValue     = 500_000.0
+      couponRate    = 0.03
+      maturityDate  = maturity
+      currency      = "USD"
+      initialHolder = buyer
+
+  submit dtc do
+    exerciseCmd badProposalCid RejectIssuance
+
+  debug "✓ Rejected issuance handled gracefully"
+  debug "✓ TestBondIssuanceFull PASSED"
+  return ()

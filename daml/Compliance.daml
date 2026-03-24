@@ -1,0 +1,198 @@
+-- | Regulatory compliance templates.
+-- Models KYC/AML onboarding, trade reporting obligations under
+-- Dodd-Frank/EMIR, and position limit enforcement — all critical
+-- to DTCC's regulated market infrastructure role.
+module Compliance where
+
+import DA.Date (Date)
+import DA.Optional (fromOptional)
+
+-- | KYC verification status for a market participant.
+data KycStatus
+  = Pending
+  | Approved
+  | Rejected
+  | Expired
+  deriving (Eq, Show)
+
+-- | Risk tier classification.
+data RiskTier = Low | Medium | High
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- KYC / Onboarding
+-- ---------------------------------------------------------------------------
+
+-- | KYC record for a market participant, maintained by the regulator/CCP.
+-- A participant must have an Approved KYC record before trading.
+template KycRecord
+  with
+    participant  : Party    -- ^ Firm or individual being onboarded
+    regulator    : Party    -- ^ Regulatory authority (SEC, FINRA, etc.)
+    ccp          : Party    -- ^ Central counterparty relying on the record
+    legalName    : Text
+    lei          : Text     -- ^ Legal Entity Identifier (ISO 17442)
+    kycStatus    : KycStatus
+    riskTier     : RiskTier
+    approvedDate : Optional Date
+    expiryDate   : Optional Date
+    notes        : Text
+  where
+    signatory regulator
+    observer  participant, ccp
+
+    -- | Regulator approves the KYC — participant may now trade.
+    choice ApproveKyc : ContractId KycRecord
+      with
+        approvedOn : Date
+        expiresOn  : Date
+      controller regulator
+      do
+        assertMsg "Only Pending records can be approved" (kycStatus == Pending)
+        create this with
+          kycStatus    = Approved
+          approvedDate = Some approvedOn
+          expiryDate   = Some expiresOn
+
+    -- | Regulator rejects the application.
+    choice RejectKyc : ContractId KycRecord
+      with
+        reason : Text
+      controller regulator
+      do
+        create this with
+          kycStatus = Rejected
+          notes     = reason
+
+    -- | Regulator expires a previously-approved record (requires re-KYC).
+    choice ExpireKyc : ContractId KycRecord
+      controller regulator
+      do
+        assertMsg "Only Approved records can expire" (kycStatus == Approved)
+        create this with kycStatus = Expired
+
+-- ---------------------------------------------------------------------------
+-- Trade Reporting
+-- ---------------------------------------------------------------------------
+
+-- | Trade report submitted to a trade repository (e.g. DTCC GTR).
+-- Required under Dodd-Frank Title VII / EMIR for OTC derivatives;
+-- extended here to cover bond trades for completeness.
+template TradeReport
+  with
+    reportId       : Text
+    reporter       : Party   -- ^ Reporting counterparty
+    tradeRepository: Party   -- ^ DTCC GTR or equivalent
+    tradeId        : Text
+    instrument     : Text    -- ^ ISIN/CUSIP/CFI
+    notional       : Decimal
+    currency       : Text
+    tradeDate      : Date
+    reportDate     : Date
+    isAmendment    : Bool
+    isCancel       : Bool
+  where
+    signatory reporter
+    observer  tradeRepository
+
+    ensure notional > 0.0
+
+    -- | Trade repository acknowledges receipt of the report.
+    choice AcknowledgeReport : ContractId TradeReport
+      controller tradeRepository
+      do create this
+
+    -- | Submit an amended report (post-trade correction).
+    choice AmendReport : ContractId TradeReport
+      with
+        amendedNotional : Decimal
+        amendDate       : Date
+      controller reporter
+      do
+        assertMsg "Can only amend non-cancelled reports" (not isCancel)
+        create this with
+          notional    = amendedNotional
+          reportDate  = amendDate
+          isAmendment = True
+
+    -- | Cancel a previously submitted report.
+    choice CancelReport : ContractId TradeReport
+      with
+        cancelDate : Date
+      controller reporter
+      do
+        create this with
+          isCancel   = True
+          reportDate = cancelDate
+
+-- ---------------------------------------------------------------------------
+-- Position Limits
+-- ---------------------------------------------------------------------------
+
+-- | Position limit rule defined by the regulator for a specific instrument.
+-- The CCP enforces limits at the point of trade acceptance.
+template PositionLimit
+  with
+    regulator  : Party
+    ccp        : Party
+    instrument : Text    -- ^ ISIN/CUSIP or asset class
+    maxLong    : Decimal -- ^ Maximum allowed long position (face value)
+    maxShort   : Decimal -- ^ Maximum allowed short position (absolute value)
+    currency   : Text
+  where
+    signatory regulator
+    observer  ccp
+
+    ensure maxLong >= 0.0 && maxShort >= 0.0
+
+    -- | Regulator updates the limits (e.g. market stress response).
+    choice UpdateLimits : ContractId PositionLimit
+      with
+        newMaxLong  : Decimal
+        newMaxShort : Decimal
+      controller regulator
+      do
+        create this with maxLong = newMaxLong, maxShort = newMaxShort
+
+-- | A participant's current position in an instrument, tracked by the CCP.
+template Position
+  with
+    participant : Party
+    ccp         : Party
+    instrument  : Text
+    longPos     : Decimal  -- ^ Long exposure (face value)
+    shortPos    : Decimal  -- ^ Short exposure (absolute face value)
+    currency    : Text
+  where
+    signatory ccp
+    observer  participant
+
+    ensure longPos >= 0.0 && shortPos >= 0.0
+
+    -- | CCP updates position after each trade/settlement.
+    choice UpdatePosition : ContractId Position
+      with
+        deltaLong  : Decimal  -- ^ Change in long position (can be negative)
+        deltaShort : Decimal  -- ^ Change in short position (can be negative)
+      controller ccp
+      do
+        let newLong  = longPos  + deltaLong
+            newShort = shortPos + deltaShort
+        assertMsg ("Long position cannot go negative: " <> show newLong)
+                  (newLong >= 0.0)
+        assertMsg ("Short position cannot go negative: " <> show newShort)
+                  (newShort >= 0.0)
+        create this with longPos = newLong, shortPos = newShort
+
+    -- | Check whether a prospective trade would breach position limits.
+    -- Returns True if the trade is within limits.
+    nonconsuming choice CheckPositionLimit : Bool
+      with
+        limitCid   : ContractId PositionLimit
+        tradeDelta : Decimal  -- ^ Positive = buying, negative = selling
+      controller ccp
+      do
+        limit <- fetch limitCid
+        let projectedLong  = longPos  + (if tradeDelta > 0.0 then tradeDelta  else 0.0)
+            projectedShort = shortPos + (if tradeDelta < 0.0 then -tradeDelta else 0.0)
+        return (projectedLong <= limit.maxLong && projectedShort <= limit.maxShort)

@@ -1,0 +1,107 @@
+-- | Bond instrument template representing a debt security.
+-- Models the core bond asset that is issued, transferred, and settled
+-- in fixed-income workflows — mirroring DTCC's digital bond tokenization
+-- on the Canton ledger.
+module Bond where
+
+import DA.Date (Date)
+import DA.Text (show)
+
+-- | Status of a bond in its lifecycle.
+data BondStatus
+  = Active
+  | Redeemed
+  | Transferred
+  deriving (Eq, Show)
+
+-- | A bond instrument issued by a financial entity.
+-- The issuer controls the bond; regulators and the depository
+-- observe for compliance and audit purposes.
+template Bond
+  with
+    issuer      : Party   -- ^ Bond issuer (e.g. corporate or sovereign)
+    holder      : Party   -- ^ Current bondholder
+    depository  : Party   -- ^ Central securities depository (e.g. DTC)
+    regulator   : Party   -- ^ Regulatory observer (e.g. SEC/FINRA)
+    bondId      : Text    -- ^ Unique identifier (ISIN/CUSIP)
+    faceValue   : Decimal -- ^ Par value in base currency units
+    couponRate  : Decimal -- ^ Annual coupon rate (e.g. 0.05 for 5%)
+    maturityDate: Date    -- ^ Maturity date of the bond
+    currency    : Text    -- ^ ISO 4217 currency code (e.g. "USD")
+    status      : BondStatus
+  where
+    signatory issuer, depository
+    observer  holder, regulator
+
+    ensure faceValue > 0.0
+        && couponRate >= 0.0
+        && couponRate <= 1.0
+
+    -- | Transfer the bond to a new holder.
+    -- Both counterparties and the depository must agree.
+    choice Transfer : ContractId Bond
+      with
+        newHolder : Party
+      controller holder, depository
+      do
+        create this with
+          holder = newHolder
+          status = Transferred
+
+    -- | Redeem the bond at maturity, returning face value to the holder.
+    -- Only the issuer and depository can trigger redemption.
+    choice Redeem : ()
+      controller issuer, depository
+      do
+        -- In a real system this would trigger a CashAccount.Credit
+        -- for the holder equal to faceValue + final coupon payment.
+        -- Modelled as archive for brevity; see Settlement.daml for DVP.
+        return ()
+
+    -- | Update the holder directly (used internally by settlement engine).
+    choice UpdateHolder : ContractId Bond
+      with
+        newHolder : Party
+      controller depository
+      do
+        create this with holder = newHolder
+
+-- | Proposal from issuer to create a new bond and register it with
+-- the depository. Depository acceptance results in an active Bond.
+template BondIssuanceProposal
+  with
+    issuer      : Party
+    depository  : Party
+    regulator   : Party
+    bondId      : Text
+    faceValue   : Decimal
+    couponRate  : Decimal
+    maturityDate: Date
+    currency    : Text
+    initialHolder: Party
+  where
+    signatory issuer
+    observer  depository, regulator
+
+    ensure faceValue > 0.0
+
+    -- | Depository accepts and registers the bond on the ledger.
+    choice AcceptIssuance : ContractId Bond
+      controller depository
+      do
+        create Bond with
+          issuer
+          holder = initialHolder
+          depository
+          regulator
+          bondId
+          faceValue
+          couponRate
+          maturityDate
+          currency
+          status = Active
+
+    -- | Depository rejects the issuance (e.g. KYC/compliance failure).
+    choice RejectIssuance : ()
+      controller depository
+      do return ()

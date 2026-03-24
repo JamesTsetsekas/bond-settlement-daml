@@ -1,0 +1,82 @@
+-- | Cash account ledger template.
+-- Models the payment leg of a DVP settlement — the counterpart to Bond
+-- delivery. In DTCC's NSCC/DTC infrastructure, cash settlement flows
+-- through the Federal Reserve's NSS; here we model the obligation layer.
+module CashAccount where
+
+-- | A cash account held at a custodian bank.
+template CashAccount
+  with
+    owner    : Party   -- ^ Account owner (buy-side or sell-side firm)
+    bank     : Party   -- ^ Custodian / settlement bank
+    balance  : Decimal -- ^ Current balance
+    currency : Text    -- ^ ISO 4217 currency code
+  where
+    signatory owner, bank
+    observer  []
+
+    ensure balance >= 0.0
+
+    -- | Credit the account (e.g. receiving payment in DVP).
+    choice Credit : ContractId CashAccount
+      with
+        amount    : Decimal
+        narrative : Text
+      controller bank
+      do
+        assertMsg ("Credit amount must be positive: " <> show amount)
+                  (amount > 0.0)
+        create this with balance = balance + amount
+
+    -- | Debit the account (e.g. making payment in DVP).
+    choice Debit : ContractId CashAccount
+      with
+        amount    : Decimal
+        narrative : Text
+      controller bank
+      do
+        assertMsg ("Debit amount must be positive: " <> show amount)
+                  (amount > 0.0)
+        assertMsg ("Insufficient funds. Balance: " <> show balance
+                   <> " Requested: " <> show amount)
+                  (balance >= amount)
+        create this with balance = balance - amount
+
+    -- | Transfer funds to another account (debit self, returns new CID).
+    -- The receiving account's Credit is exercised separately by the bank.
+    choice Transfer : ContractId CashAccount
+      with
+        amount      : Decimal
+        description : Text
+      controller owner, bank
+      do
+        assertMsg ("Transfer amount must be positive: " <> show amount)
+                  (amount > 0.0)
+        assertMsg ("Insufficient funds for transfer. Balance: " <> show balance)
+                  (balance >= amount)
+        create this with balance = balance - amount
+
+-- | A payment instruction authorised by the account owner.
+-- The bank processes it, executing Debit/Credit on the relevant accounts.
+template PaymentInstruction
+  with
+    fromOwner   : Party
+    fromBank    : Party
+    toOwner     : Party
+    toBank      : Party
+    amount      : Decimal
+    currency    : Text
+    reference   : Text   -- ^ Trade/settlement reference
+  where
+    signatory fromOwner, fromBank
+    observer  toOwner, toBank
+
+    ensure amount > 0.0
+
+    choice ExecutePayment : ()
+      controller fromBank, toBank
+      do return ()
+
+    choice CancelPayment : ()
+      controller fromOwner
+      do return ()

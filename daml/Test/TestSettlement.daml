@@ -1,0 +1,196 @@
+-- | Test: Complete DVP settlement flow with CCP.
+-- Demonstrates the full DTCC-style workflow:
+--   Bond issuance → Trade proposal → CCP acceptance → DVP settlement
+-- Mirrors DTCC's NSCC continuous net settlement and DTC delivery process.
+module Test.TestSettlement where
+
+import Daml.Script
+import DA.Date (date, Month(..))
+
+import Bond
+import CashAccount
+import Trade
+import Settlement
+
+testDvpSettlementFull : Script ()
+testDvpSettlementFull = do
+  -- ── Allocate parties ────────────────────────────────────────────────────
+  issuer     <- allocatePartyWithHint "JPMorgan-Issuer"     (PartyIdHint "JPMorgan")
+  seller     <- allocatePartyWithHint "CitiGroup-Seller"    (PartyIdHint "Citi")
+  buyer      <- allocatePartyWithHint "PIMCO-Buyer"         (PartyIdHint "PIMCO")
+  nscc       <- allocatePartyWithHint "NSCC-CCP"            (PartyIdHint "NSCC")
+  dtc        <- allocatePartyWithHint "DTC-Depository"      (PartyIdHint "DTC")
+  buyerBank  <- allocatePartyWithHint "BNY-BuyerBank"       (PartyIdHint "BNYBuyer")
+  sellerBank <- allocatePartyWithHint "BNY-SellerBank"      (PartyIdHint "BNYSeller")
+  sec        <- allocatePartyWithHint "SEC-Regulator"       (PartyIdHint "SEC")
+
+  let settlementDate = date 2025 Jun 15
+      maturityDate   = date 2030 Dec 31
+
+  -- ── Step 1: Issue the bond ──────────────────────────────────────────────
+  proposalCid <- submit issuer do
+    createCmd BondIssuanceProposal with
+      issuer        = issuer
+      depository    = dtc
+      regulator     = sec
+      bondId        = "US46625HRL27"
+      faceValue     = 5_000_000.0
+      couponRate    = 0.0525          -- 5.25%
+      maturityDate  = maturityDate
+      currency      = "USD"
+      initialHolder = seller          -- Citi holds the bond initially
+
+  bondCid <- submit dtc do exerciseCmd proposalCid AcceptIssuance
+  debug "✓ Bond issued: US46625HRL27, $5M face, 5.25% coupon"
+
+  -- ── Step 2: Create cash accounts for buyer and seller ──────────────────
+  buyerAccountCid <- submit buyer do
+    createCmd CashAccount with
+      owner    = buyer
+      bank     = buyerBank
+      balance  = 5_100_000.0   -- enough to cover the purchase
+      currency = "USD"
+
+  sellerAccountCid <- submit seller do
+    createCmd CashAccount with
+      owner    = seller
+      bank     = sellerBank
+      balance  = 0.0
+      currency = "USD"
+
+  debug "✓ Cash accounts created (Buyer: $5.1M, Seller: $0)"
+
+  -- ── Step 3: Buyer proposes trade to seller ─────────────────────────────
+  tradeCid <- submit buyer do
+    createCmd Trade with
+      tradeId        = "TRD-20250614-0001"
+      buyer          = buyer
+      seller         = seller
+      ccp            = nscc
+      bondId         = "US46625HRL27"
+      faceValue      = 5_000_000.0
+      price          = 99.50          -- 99.50 clean price
+      settlementDate = settlementDate
+      currency       = "USD"
+      status         = Proposed
+
+  debug "✓ Trade proposed: PIMCO buys 5M face from Citi at 99.50"
+
+  -- ── Step 4: Seller accepts the trade ───────────────────────────────────
+  acceptedTradeCid <- submit seller do
+    exerciseCmd tradeCid AcceptTrade
+
+  debug "✓ Trade accepted by Citi"
+
+  -- ── Step 5: CCP initiates settlement instruction ───────────────────────
+  let paymentAmount = 5_000_000.0 * (99.50 / 100.0)  -- $4,975,000
+
+  settlementCid <- submit nscc do
+    createCmd Settlement with
+      settlementId   = "SETTL-20250615-0001"
+      tradeId        = "TRD-20250614-0001"
+      ccp            = nscc
+      buyer          = buyer
+      seller         = seller
+      buyerBank      = buyerBank
+      sellerBank     = sellerBank
+      depository     = dtc
+      bondId         = "US46625HRL27"
+      faceValue      = 5_000_000.0
+      paymentAmount  = paymentAmount
+      currency       = "USD"
+      deliveryStatus = Pending
+      paymentStatus  = Pending
+
+  debug "✓ Settlement instruction created: $4,975,000 DVP"
+
+  -- ── Step 6: Validate delivery leg (DTC confirms securities available) ───
+  settledDeliveryCid <- submit nscc do
+    exerciseCmd settlementCid ValidateDelivery
+
+  debug "✓ Delivery leg validated by DTC"
+
+  -- ── Step 7: Validate payment leg (buyer's bank confirms funds) ──────────
+  settledPaymentCid <- submit nscc do
+    exerciseCmd settledDeliveryCid ValidatePayment
+
+  debug "✓ Payment leg validated by BNY"
+
+  -- ── Step 8: Execute atomic DVP settlement ──────────────────────────────
+  (finalSettlementCid, newBondCid, newBuyerAccountCid, newSellerAccountCid) <-
+    submit nscc do
+      exerciseCmd settledPaymentCid ExecuteSettlement with
+        bondCid          = bondCid
+        buyerAccountCid  = buyerAccountCid
+        sellerAccountCid = sellerAccountCid
+        tradeCid         = acceptedTradeCid
+
+  debug "✓ DVP executed atomically — bond delivered, cash transferred"
+
+  -- ── Verify final state ──────────────────────────────────────────────────
+  finalBond <- queryContractId buyer newBondCid
+  case finalBond of
+    None   -> abort "Bond not found after settlement!"
+    Some b -> assertMsg "PIMCO should now hold the bond" (b.holder == buyer)
+
+  finalBuyerAccount <- queryContractId buyer newBuyerAccountCid
+  case finalBuyerAccount of
+    None   -> abort "Buyer cash account not found!"
+    Some a -> do
+      let expectedBalance = 5_100_000.0 - paymentAmount
+      assertMsg "Buyer balance should be reduced by payment"
+                (a.balance == expectedBalance)
+
+  finalSellerAccount <- queryContractId seller newSellerAccountCid
+  case finalSellerAccount of
+    None   -> abort "Seller cash account not found!"
+    Some a -> assertMsg "Seller should have received payment"
+                        (a.balance == paymentAmount)
+
+  debug "✓ Final state verified: bond holder = PIMCO, cash settled"
+  debug "✓ TestDvpSettlementFull PASSED"
+  return ()
+
+
+-- | Test settlement failure path (insufficient funds).
+testSettlementFailure : Script ()
+testSettlementFailure = do
+  nscc       <- allocatePartyWithHint "NSCC-CCP-Fail"    (PartyIdHint "NSCCFail")
+  buyer      <- allocatePartyWithHint "Buyer-Fail"       (PartyIdHint "BuyerFail")
+  seller     <- allocatePartyWithHint "Seller-Fail"      (PartyIdHint "SellerFail")
+  buyerBank  <- allocatePartyWithHint "BuyerBank-Fail"   (PartyIdHint "BBankFail")
+  sellerBank <- allocatePartyWithHint "SellerBank-Fail"  (PartyIdHint "SBankFail")
+  dtc        <- allocatePartyWithHint "DTC-Fail"         (PartyIdHint "DTCFail")
+
+  settlementCid <- submit nscc do
+    createCmd Settlement with
+      settlementId   = "SETTL-FAIL-001"
+      tradeId        = "TRD-FAIL-001"
+      ccp            = nscc
+      buyer          = buyer
+      seller         = seller
+      buyerBank      = buyerBank
+      sellerBank     = sellerBank
+      depository     = dtc
+      bondId         = "US-TEST-001"
+      faceValue      = 1_000_000.0
+      paymentAmount  = 990_000.0
+      currency       = "USD"
+      deliveryStatus = Pending
+      paymentStatus  = Pending
+
+  -- Fail the payment leg (insufficient funds)
+  failedCid <- submit nscc do
+    exerciseCmd settlementCid FailSettlement with
+      failedLeg = "PAYMENT"
+      reason    = "Buyer account has insufficient funds"
+
+  failedSettlement <- queryContractId nscc failedCid
+  case failedSettlement of
+    None   -> abort "Failed settlement not found"
+    Some s -> assertMsg "Payment leg should be Failed"
+                        (s.paymentStatus == Failed)
+
+  debug "✓ Settlement failure handled correctly"
+  debug "✓ TestSettlementFailure PASSED"
+  return ()

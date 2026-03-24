@@ -1,0 +1,13 @@
+# DAML build artifacts
+.daml/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

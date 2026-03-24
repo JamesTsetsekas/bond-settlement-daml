@@ -1,0 +1,144 @@
+-- | Delivery-versus-Payment (DVP) settlement with Central Counterparty.
+-- Models the DTCC/DTC settlement process where the CCP (NSCC) validates
+-- both legs before executing atomic transfer of securities vs. cash.
+--
+-- Workflow:
+--   1. CCP initiates settlement from an accepted trade
+--   2. Delivery leg validated (bond/securities from seller)
+--   3. Payment leg validated (cash from buyer)
+--   4. CCP executes atomic DVP — both legs settle simultaneously or fail
+--
+-- This mirrors DTCC's Continuous Net Settlement (CNS) and DTC's
+-- Deliver Order (DO) mechanism on the Canton-based digital asset ledger.
+module Settlement where
+
+import Bond (Bond, UpdateHolder(..))
+import CashAccount (CashAccount, Debit(..), Credit(..))
+import Trade (Trade, MarkSettled(..))
+
+-- | Validation status for each settlement leg.
+data LegStatus
+  = Pending
+  | Validated
+  | Failed
+  deriving (Eq, Show)
+
+-- | DVP settlement instruction managed by the CCP.
+-- The CCP acts as the single settlement agent, ensuring atomicity.
+template Settlement
+  with
+    settlementId    : Text          -- ^ Unique settlement instruction ID
+    tradeId         : Text          -- ^ Reference to the originating trade
+    ccp             : Party         -- ^ Central counterparty (NSCC/DTC)
+    buyer           : Party         -- ^ Receiving party (payment leg initiator)
+    seller          : Party         -- ^ Delivering party (delivery leg initiator)
+    buyerBank       : Party         -- ^ Buyer's custodian/settlement bank
+    sellerBank      : Party         -- ^ Seller's custodian/settlement bank
+    depository      : Party         -- ^ Central securities depository (DTC)
+    bondId          : Text          -- ^ Security being delivered
+    faceValue       : Decimal       -- ^ Notional of the delivery leg
+    paymentAmount   : Decimal       -- ^ Cash owed (price × faceValue / 100)
+    currency        : Text
+    deliveryStatus  : LegStatus     -- ^ Securities leg validation state
+    paymentStatus   : LegStatus     -- ^ Cash leg validation state
+  where
+    signatory ccp
+    observer  buyer, seller, buyerBank, sellerBank, depository
+
+    ensure faceValue > 0.0 && paymentAmount > 0.0
+
+    -- | CCP confirms securities are available for delivery (DTC locate/affirm).
+    choice ValidateDelivery : ContractId Settlement
+      controller ccp, depository
+      do
+        assertMsg "Delivery already validated or failed"
+                  (deliveryStatus == Pending)
+        create this with deliveryStatus = Validated
+
+    -- | CCP confirms payment funds are available (bank confirmation).
+    choice ValidatePayment : ContractId Settlement
+      controller ccp, buyerBank
+      do
+        assertMsg "Payment already validated or failed"
+                  (paymentStatus == Pending)
+        create this with paymentStatus = Validated
+
+    -- | Atomic DVP execution: transfer bond + debit/credit cash simultaneously.
+    -- Both legs must be Validated before execution is permitted.
+    choice ExecuteSettlement
+      : (ContractId Settlement, ContractId Bond, ContractId CashAccount, ContractId CashAccount)
+      with
+        bondCid         : ContractId Bond
+        buyerAccountCid : ContractId CashAccount
+        sellerAccountCid: ContractId CashAccount
+        tradeCid        : ContractId Trade
+      controller ccp
+      do
+        assertMsg "Both legs must be validated before DVP execution"
+                  (deliveryStatus == Validated && paymentStatus == Validated)
+
+        -- Transfer the bond from seller to buyer via depository
+        newBondCid <- exercise bondCid UpdateHolder with newHolder = buyer
+
+        -- Debit buyer's cash account
+        newBuyerAccountCid <- exercise buyerAccountCid Debit with
+          amount    = paymentAmount
+          narrative = "DVP payment for trade " <> tradeId
+
+        -- Credit seller's cash account
+        newSellerAccountCid <- exercise sellerAccountCid Credit with
+          amount    = paymentAmount
+          narrative = "DVP receipt for trade " <> tradeId
+
+        -- Mark trade as settled
+        exercise tradeCid MarkSettled
+
+        -- Archive and return settled record
+        settledCid <- create this with
+          deliveryStatus = Validated
+          paymentStatus  = Validated
+
+        return (settledCid, newBondCid, newBuyerAccountCid, newSellerAccountCid)
+
+    -- | Fail the settlement (insufficient funds, securities recall, etc.).
+    choice FailSettlement : ContractId Settlement
+      with
+        failedLeg : Text   -- ^ "DELIVERY" | "PAYMENT" | "BOTH"
+        reason    : Text
+      controller ccp
+      do
+        create this with
+          deliveryStatus = if failedLeg == "DELIVERY" || failedLeg == "BOTH"
+                           then Failed else deliveryStatus
+          paymentStatus  = if failedLeg == "PAYMENT"  || failedLeg == "BOTH"
+                           then Failed else paymentStatus
+
+
+-- | Netting record: aggregates multiple settlement obligations between
+-- the same counterparty pair into a single net position.
+-- Mirrors DTCC's Continuous Net Settlement (CNS) netting algorithm.
+template NetSettlement
+  with
+    netId       : Text
+    ccp         : Party
+    party       : Party
+    bondId      : Text
+    netPosition : Decimal  -- ^ Positive = net receiver, negative = net deliverer
+    netCash     : Decimal  -- ^ Positive = net cash receiver, negative = payer
+    currency    : Text
+    tradeIds    : [Text]   -- ^ Constituent trade IDs
+  where
+    signatory ccp
+    observer  party
+
+    ensure True  -- net position can be zero for flat books
+
+    -- | Party acknowledges their net obligation.
+    choice AcknowledgeNet : ContractId NetSettlement
+      controller party
+      do create this
+
+    -- | CCP discharges the net obligation after settlement completes.
+    choice DischargeNet : ()
+      controller ccp
+      do return ()
