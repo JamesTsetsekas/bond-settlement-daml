@@ -13,7 +13,7 @@ template CashAccount
     currency : Text    -- ^ ISO 4217 currency code
   where
     signatory owner, bank
-    observer  []
+    observer  ([] : [Party])
 
     ensure balance >= 0.0
 

@@ -4,8 +4,6 @@
 -- on the Canton ledger.
 module Bond where
 
-import DA.Date (Date)
-import DA.Text (show)
 
 -- | Status of a bond in its lifecycle.
 data BondStatus

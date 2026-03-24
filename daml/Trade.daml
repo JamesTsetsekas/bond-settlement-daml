@@ -4,8 +4,6 @@
 -- Status lifecycle: Proposed → Accepted → Settled | Rejected
 module Trade where
 
-import DA.Date (Date)
-
 -- | Lifecycle status of a trade.
 data TradeStatus
   = Proposed

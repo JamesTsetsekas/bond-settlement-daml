@@ -1,4 +1,4 @@
-sdk-version: 2.9.3
+sdk-version: 3.4.11
 name: bond-settlement-daml
 version: 1.0.0
 source: daml

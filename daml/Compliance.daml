@@ -4,7 +4,6 @@
 -- to DTCC's regulated market infrastructure role.
 module Compliance where
 
-import DA.Date (Date)
 import DA.Optional (fromOptional)
 
 -- | KYC verification status for a market participant.
