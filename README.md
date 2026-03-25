@@ -286,3 +286,10 @@ This codebase directly maps to DTCC's live production work:
 
 MIT — educational reference implementation.  
 Not affiliated with or endorsed by DTCC or Digital Asset Holdings.
+
+## Future Enhancements
+
+- **Multilateral netting**: Extend NetSettlement to support CNS-style batch netting across multiple counterparties
+- **Corporate actions**: Model dividend payments, stock splits, and redemptions on bond instruments
+- **Cross-chain interop**: Bridge Canton settlements with on-chain Ethereum token transfers
+- **Regulatory reporting**: Automated DTCC GTR trade report generation from settlement events
